@@ -58,6 +58,7 @@ func (bnc *BaseNetworkController) allocatePodIPs(pod *kapi.Pod,
 				"condition. Pod: %s/%s, node: %s", pod.Namespace, pod.Name, pod.Spec.NodeName)
 		}
 	}
+
 	if err := bnc.waitForNodeLogicalSwitchSubnetsInCache(switchNames.Original); err != nil {
 		return expectedLogicalPortName, fmt.Errorf("failed to wait for switch %s to be added to cache. IP allocation may fail!",
 			switchNames)
@@ -660,8 +661,9 @@ func (bnc *BaseNetworkController) addLogicalPortToNetwork(pod *kapi.Pod, nadName
 		lsp.DynamicAddresses = nil
 
 		// At interconnect the logical switch manager only knows stuff about
-		// the current switch if we ask for original switch after
-		// live migration this fails, that's why we skip it here.
+		// local zone nodes if we ask for original switch after
+		// live migration this fails, that's why we skip it here, also on
+		// controller restart the IPs are already allocated by syncPods.
 		needsIP = switchNames.Original == switchNames.Current
 		if needsIP {
 			if bnc.doesNetworkRequireIPAM() {

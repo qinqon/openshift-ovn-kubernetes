@@ -6,9 +6,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	utilnet "k8s.io/utils/net"
-	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	libovsdbclient "github.com/ovn-org/libovsdb/client"
+
+	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/factory"
@@ -51,7 +52,6 @@ func EnsureDHCPOptionsForVM(controllerName string, nbClient libovsdbclient.Clien
 	}
 	return nil
 }
-
 func ComposeDHCPConfigs(k8scli *factory.WatchFactory, controllerName, namespace, vmName string, podIPs []*net.IPNet) (*DHCPConfigs, error) {
 	if len(podIPs) == 0 {
 		return nil, fmt.Errorf("missing podIPs to compose dhcp options")
@@ -135,6 +135,7 @@ func composeDHCPOptions(controllerName, namespace, vmName string, dhcpOptions *n
 			libovsdbops.NamespaceKey:      namespace,
 		})
 	dhcpOptions.ExternalIDs = dhcpvOptionsDbObjectID.GetExternalIDs()
+	dhcpOptions.ExternalIDs[OvnZoneExternalIDKey] = OvnLocalZone
 	return dhcpOptions
 }
 
@@ -143,11 +144,6 @@ func DeleteDHCPOptions(controllerName string, nbClient libovsdbclient.Client, po
 	if vmKey == nil {
 		return nil
 	}
-	dbObjectIDs := libovsdbops.NewDbObjectIDs(libovsdbops.VirtualMachineDHCPOptions, controllerName,
-		map[libovsdbops.ExternalIDKey]string{
-			libovsdbops.NamespaceKey:      vmKey.Namespace,
-			libovsdbops.VirtualMachineKey: vmKey.Name,
-		})
 	podAnnotation, err := util.UnmarshalPodAnnotation(pod.Annotations, networkName)
 	if err != nil {
 		return err
@@ -157,6 +153,12 @@ func DeleteDHCPOptions(controllerName string, nbClient libovsdbclient.Client, po
 			IP:   ipNet.IP.Mask(ipNet.Mask),
 			Mask: ipNet.Mask,
 		}
+		dbObjectIDs := libovsdbops.NewDbObjectIDs(libovsdbops.VirtualMachineDHCPOptions, controllerName,
+			map[libovsdbops.ExternalIDKey]string{
+				libovsdbops.ObjectNameKey:     cidr.String(),
+				libovsdbops.NamespaceKey:      vmKey.Namespace,
+				libovsdbops.VirtualMachineKey: vmKey.Name,
+			})
 		if err := libovsdbops.DeleteDHCPOptions(nbClient, &nbdb.DHCPOptions{
 			Cidr:        cidr.String(),
 			ExternalIDs: dbObjectIDs.GetExternalIDs(),

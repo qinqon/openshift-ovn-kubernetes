@@ -27,13 +27,27 @@ func (oc *DefaultNetworkController) syncPods(pods []interface{}) error {
 	//
 	// TBD: Before this succeeds, add Pod handler should not continue to allocate IPs for the new Pods.
 	expectedLogicalPorts := make(map[string]bool)
+	vms := make(map[ktypes.NamespacedName]bool)
 	for _, podInterface := range pods {
 		pod, ok := podInterface.(*kapi.Pod)
 		if !ok {
 			return fmt.Errorf("spurious object in syncPods: %v", podInterface)
 		}
-
-		if !oc.isPodScheduledinLocalZone(pod) {
+		if kubevirt.IsPodLiveMigratable(pod) {
+			vm := kubevirt.ExtractVMNameFromPod(pod)
+			if vm != nil {
+				vms[*vm] = oc.isPodScheduledinLocalZone(pod)
+			}
+			switchNames, err := oc.getSwitchNames(pod)
+			if err != nil {
+				return fmt.Errorf("failed reading vm pod %s/%s switch names at syncPods: %v", pod.Namespace, pod.Name, err)
+			}
+			// after live migration the original node should fill in it's
+			// switch manager cache with VMs IP at controller restart
+			if _, ok := oc.localZoneNodes.Load(switchNames.Original); !ok {
+				continue
+			}
+		} else if !oc.isPodScheduledinLocalZone(pod) {
 			continue
 		}
 
@@ -47,6 +61,7 @@ func (oc *DefaultNetworkController) syncPods(pods []interface{}) error {
 		}
 		if expectedLogicalPortName != "" {
 			expectedLogicalPorts[expectedLogicalPortName] = true
+
 		}
 
 		// delete the outdated hybrid overlay subnet route if it exists
@@ -93,6 +108,10 @@ func (oc *DefaultNetworkController) syncPods(pods []interface{}) error {
 		}
 	}
 
+	if err := kubevirt.SyncVirtualMachines(oc.nbClient, vms); err != nil {
+		return fmt.Errorf("failed syncing running virtual machines: %v", err)
+	}
+
 	return oc.deleteStaleLogicalSwitchPorts(expectedLogicalPorts)
 }
 
@@ -111,11 +130,6 @@ func (oc *DefaultNetworkController) deleteLogicalPort(pod *kapi.Pod, portInfo *l
 	if err != nil {
 		return err
 	}
-
-	if err := kubevirt.CleanUpForVM(oc.controllerName, oc.nbClient, oc.watchFactory, pod, oc.GetNetworkName()); err != nil {
-		return err
-	}
-
 	// do not remove SNATs/GW routes/IPAM for an IP address unless we have validated no other pod is using it
 	if pInfo == nil {
 		return nil
@@ -142,6 +156,7 @@ func (oc *DefaultNetworkController) deleteLogicalPort(pod *kapi.Pod, portInfo *l
 }
 
 func (oc *DefaultNetworkController) addLogicalPort(pod *kapi.Pod) (err error) {
+
 	// If a node does node have an assigned hostsubnet don't wait for the logical switch to appear
 	switchName := pod.Spec.NodeName
 	if oc.lsManager.IsNonHostSubnetSwitch(switchName) {

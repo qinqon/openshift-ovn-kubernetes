@@ -12,7 +12,6 @@ import (
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	libovsdbclient "github.com/ovn-org/libovsdb/client"
-
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/kube"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
@@ -31,11 +30,7 @@ func FindVMRelatedPods(client *factory.WatchFactory, pod *corev1.Pod) ([]*corev1
 	if !ok {
 		return nil, nil
 	}
-	vmPods, err := client.GetPodsBySelector(pod.Namespace, metav1.LabelSelector{MatchLabels: map[string]string{kubevirtv1.VirtualMachineNameLabel: vmName}})
-	if err != nil {
-		return nil, err
-	}
-	return vmPods, nil
+	return client.GetPodsBySelector(pod.Namespace, metav1.LabelSelector{MatchLabels: map[string]string{kubevirtv1.VirtualMachineNameLabel: vmName}})
 }
 
 // FindNetworkInfo will return the original switch name and the OVN pod
@@ -158,7 +153,7 @@ func IsMigratedSourcePodStale(client *factory.WatchFactory, pod *corev1.Pod) (bo
 	return false, nil
 }
 
-// ExternalIDContainsVM return true if the nbdb ExternalIDs has namespace
+// ExternalIDsContainsVM return true if the nbdb ExternalIDs has namespace
 // and name entries matching the VM
 func ExternalIDsContainsVM(externalIDs map[string]string, vm *ktypes.NamespacedName) bool {
 	if vm == nil {
@@ -196,6 +191,9 @@ func CleanUpForVM(controllerName string, nbClient libovsdbclient.Client, watchFa
 		return nil
 	}
 	if err := DeleteDHCPOptions(controllerName, nbClient, pod, networkName); err != nil {
+		return err
+	}
+	if err := DeleteRoutingForMigratedPod(nbClient, pod); err != nil {
 		return err
 	}
 	return nil

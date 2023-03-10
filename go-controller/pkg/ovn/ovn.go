@@ -12,6 +12,7 @@ import (
 	libovsdbclient "github.com/ovn-org/libovsdb/client"
 
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/kubevirt"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/metrics"
 	addressset "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/address_set"
 	egresssvc_zone "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/controller/egressservice"
@@ -172,11 +173,22 @@ func (oc *DefaultNetworkController) ensureLocalZonePod(oldPod, pod *kapi.Pod, ad
 			return fmt.Errorf("addLogicalPort failed for %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 	} else {
+
 		// either pod is host-networked or its an update for a normal pod (addPort=false case)
 		if oldPod == nil || exGatewayAnnotationsChanged(oldPod, pod) || networkStatusAnnotationsChanged(oldPod, pod) {
 			if err := oc.addPodExternalGW(pod); err != nil {
 				return fmt.Errorf("addPodExternalGW failed for %s/%s: %w", pod.Namespace, pod.Name, err)
 			}
+		}
+	}
+
+	if kubevirt.IsPodLiveMigratable(pod) {
+		switchNames, err := oc.getSwitchNames(pod)
+		if err != nil {
+			return fmt.Errorf("failed retrieving switch names when ensuring local zone for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		}
+		if err := kubevirt.EnsureRoutingForVM(oc.controllerName, oc.watchFactory, oc.nbClient, switchNames, true /* local zone */, pod, oc.GetNetworkName()); err != nil {
+			return fmt.Errorf("failed ensureRoutingForVM for %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 	}
 
@@ -216,7 +228,11 @@ func (oc *DefaultNetworkController) ensureRemoteZonePod(oldPod, pod *kapi.Pod, a
 			return fmt.Errorf("addPodExternalGW failed for remote pod %s/%s: %v", pod.Namespace, pod.Name, err)
 		}
 	}
-	return nil
+	switchNames, err := oc.getSwitchNames(pod)
+	if err != nil {
+		return fmt.Errorf("failed retrieving switch names when ensuring remote zone for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+	return kubevirt.EnsureRoutingForVM(oc.controllerName, oc.watchFactory, oc.nbClient, switchNames, false /* remote zone */, pod, oc.GetNetworkName())
 }
 
 // removePod tried to tear down a pod. It returns nil on success and error on failure;
@@ -226,7 +242,7 @@ func (oc *DefaultNetworkController) removePod(pod *kapi.Pod, portInfo *lpInfo) e
 		return oc.removeLocalZonePod(pod, portInfo)
 	}
 
-	return oc.removeRemoteZonePod(pod)
+	return oc.removeRemoteZonePod(pod, portInfo)
 }
 
 // removeLocalZonePod tries to tear down a local zone pod. It returns nil on success and error on failure;
@@ -252,6 +268,11 @@ func (oc *DefaultNetworkController) removeLocalZonePod(pod *kapi.Pod, portInfo *
 		return fmt.Errorf("deleteLogicalPort failed for pod %s: %w",
 			getPodNamespacedName(pod), err)
 	}
+
+	if err := kubevirt.CleanUpForVM(oc.controllerName, oc.nbClient, oc.watchFactory, pod, oc.GetNetworkName()); err != nil {
+		return fmt.Errorf("failed removing local zone VM artifacts: %v", err)
+	}
+
 	return nil
 }
 
@@ -259,7 +280,7 @@ func (oc *DefaultNetworkController) removeLocalZonePod(pod *kapi.Pod, portInfo *
 // failure indicates the pod tear down should be retried later.
 // It removes the remote pod ips from the namespace address set and if its an external gw pod, removes
 // its routes.
-func (oc *DefaultNetworkController) removeRemoteZonePod(pod *kapi.Pod) error {
+func (oc *DefaultNetworkController) removeRemoteZonePod(pod *kapi.Pod, portInfo *lpInfo) error {
 	if err := oc.removeRemoteZonePodFromNamespaceAddressSet(pod); err != nil {
 		return fmt.Errorf("failed to remove the remote zone pod : %w", err)
 	}
@@ -269,6 +290,19 @@ func (oc *DefaultNetworkController) removeRemoteZonePod(pod *kapi.Pod) error {
 		if err := oc.deletePodExternalGW(pod); err != nil {
 			return fmt.Errorf("unable to delete external gateway routes for remote pod %s: %w",
 				getPodNamespacedName(pod), err)
+		}
+	}
+	if kubevirt.IsPodLiveMigratable(pod) {
+		// After live migration to a different zone ip should be deallocated
+		// from remote zone if VM is gone
+		if err := oc.deleteLogicalPort(pod, portInfo); err != nil {
+			return fmt.Errorf("deleteLogicalPort failed for VM pod %s: %w at remote zone",
+				getPodNamespacedName(pod), err)
+		}
+
+		// Do the VM specific cleanups from remote zone
+		if err := kubevirt.CleanUpForVM(oc.controllerName, oc.nbClient, oc.watchFactory, pod, oc.GetNetworkName()); err != nil {
+			return fmt.Errorf("failed removing local zone VM artifacts: %v", err)
 		}
 	}
 
