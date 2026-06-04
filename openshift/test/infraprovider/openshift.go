@@ -25,21 +25,52 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 )
 
+// clusterInfraProvider is implemented by both baremetalInfra and awsInfra,
+// providing external container management for different platforms.
+type clusterInfraProvider interface {
+	GetNetwork(name string) (api.Network, error)
+	GetExternalContainerNetworkInterface(container api.ExternalContainer, network api.Network) (api.NetworkInterface, error)
+	ExecExternalContainerCommand(container api.ExternalContainer, cmd []string) (string, error)
+	ExternalContainerPrimaryInterfaceName() string
+	GetExternalContainerLogs(container api.ExternalContainer) (string, error)
+	GetExternalContainerPort() uint16
+	ListNetworks() ([]string, error)
+	GetExternalContainerContextProvider(context *testcontext.TestContext) api.ExternalContainerContextProvider
+}
+
 type OpenshiftInfraProvider struct {
 	clusterFeatureGate      *configv1.FeatureGate
 	operNetwork             *operv1.Network
 	hasFRRExternalContainer bool
 	hostPort                *portalloc.PortAllocator
-	clusterInfra            *baremetalInfra
+	clusterInfra            clusterInfraProvider
 }
 
 func New(config *rest.Config) (*OpenshiftInfraProvider, error) {
 	ovnkconfig.Kubernetes.DNSServiceNamespace = "openshift-dns"
 	ovnkconfig.Kubernetes.DNSServiceName = "dns-default"
-	clusterInfra, err := initializeClusterInfra(config)
+
+	// Try baremetal infra first (existing behavior)
+	var clusterInfra clusterInfraProvider
+	bmInfra, err := initializeClusterInfra(config)
 	if err != nil {
 		return nil, err
 	}
+	if bmInfra != nil {
+		clusterInfra = bmInfra
+	}
+
+	// If not baremetal, try AWS
+	if clusterInfra == nil {
+		awsInfra, err := initializeAWSInfra(config)
+		if err != nil {
+			return nil, err
+		}
+		if awsInfra != nil {
+			clusterInfra = awsInfra
+		}
+	}
+
 	o := &OpenshiftInfraProvider{
 		hostPort:     portalloc.New(30000, 32767),
 		clusterInfra: clusterInfra,

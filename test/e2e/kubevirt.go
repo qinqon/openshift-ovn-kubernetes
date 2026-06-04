@@ -1718,6 +1718,17 @@ ethernets:
     dhcp4: true
     dhcp6: true
     ipv6-address-generation: eui64`
+			// networkDataForCluster returns the appropriate cloud-init
+			// network data for the cluster's IP family support. On
+			// single-stack IPv4 clusters, using networkDataDualStack
+			// causes NetworkManager to tear down the entire connection
+			// when DHCPv6 fails (may-fail=false).
+			networkDataForCluster = func() string {
+				if isIPv6Supported(fr.ClientSet) {
+					return networkDataDualStack
+				}
+				return networkDataIPv4
+			}
 			userData = `
 #cloud-config
 password: fedora
@@ -1751,15 +1762,15 @@ write_files:
 					vm = fedoraWithTestToolingVM(nil /*labels*/, nil /*annotations*/, nil, /*nodeSelector*/
 						kubevirtv1.NetworkSource{
 							Pod: &kubevirtv1.PodNetwork{},
-						}, userDataWithIperfServer, networkDataDualStack)
-					vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].Bridge = nil
-					vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].Binding = &kubevirtv1.PluginBinding{Name: "l2bridge"}
-					createVirtualMachine(vm)
-					return vm.Name
-				},
-			}
+					}, userDataWithIperfServer, networkDataForCluster())
+				vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].Bridge = nil
+				vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].Binding = &kubevirtv1.PluginBinding{Name: "l2bridge"}
+				createVirtualMachine(vm)
+				return vm.Name
+			},
+		}
 
-			virtualMachineWithUDNAndStaticIPsAndMAC = resourceCommand{
+		virtualMachineWithUDNAndStaticIPsAndMAC = resourceCommand{
 				description: "VirtualMachine with interface binding for UDN and statics IPs and MAC",
 				cmd: func() string {
 					GinkgoHelper()
@@ -1773,10 +1784,10 @@ write_files:
 					vm = fedoraWithTestToolingVM(nil /*labels*/, annotations, nil, /*nodeSelector*/
 						kubevirtv1.NetworkSource{
 							Pod: &kubevirtv1.PodNetwork{},
-						}, userDataWithIperfServer, networkDataDualStack)
-					vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].Bridge = nil
-					vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].Binding = &kubevirtv1.PluginBinding{Name: "l2bridge"}
-					vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].MacAddress = staticMAC
+					}, userDataWithIperfServer, networkDataForCluster())
+				vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].Bridge = nil
+				vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].Binding = &kubevirtv1.PluginBinding{Name: "l2bridge"}
+				vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].MacAddress = staticMAC
 					createVirtualMachine(vm)
 					return vm.Name
 				},
@@ -1801,9 +1812,9 @@ write_files:
 					vmi = fedoraWithTestToolingVMI(nil /*labels*/, nil /*annotations*/, nil, /*nodeSelector*/
 						kubevirtv1.NetworkSource{
 							Pod: &kubevirtv1.PodNetwork{},
-						}, userDataWithIperfServer, networkDataDualStack)
-					vmi.Spec.Domain.Devices.Interfaces[0].Bridge = nil
-					vmi.Spec.Domain.Devices.Interfaces[0].Binding = &kubevirtv1.PluginBinding{Name: "l2bridge"}
+					}, userDataWithIperfServer, networkDataForCluster())
+				vmi.Spec.Domain.Devices.Interfaces[0].Bridge = nil
+				vmi.Spec.Domain.Devices.Interfaces[0].Binding = &kubevirtv1.PluginBinding{Name: "l2bridge"}
 					createVirtualMachineInstance(vmi)
 					return vmi.Name
 				},
@@ -2042,10 +2053,10 @@ write_files:
 			}
 
 			var externalContainerIPs []string
-			if externalContainer.IsIPv4() {
+			if externalContainer.IsIPv4() && isIPv4Supported(fr.ClientSet) {
 				externalContainerIPs = append(externalContainerIPs, externalContainer.IPv4)
 			}
-			if externalContainer.IsIPv6() {
+			if externalContainer.IsIPv6() && isIPv6Supported(fr.ClientSet) {
 				externalContainerIPs = append(externalContainerIPs, externalContainer.IPv6)
 			}
 
