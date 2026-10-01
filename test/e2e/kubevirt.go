@@ -1447,8 +1447,8 @@ passwd:
 			}, 30*time.Second, time.Second).Should(Equal("Accepted"))
 		}
 
-		getCUDNSubnets = func(cudn *udnv1.ClusterUserDefinedNetwork) []string {
-			nad, err := nadClient.NetworkAttachmentDefinitions(namespace).Get(context.TODO(), cudn.Name, metav1.GetOptions{})
+		getCUDNSubnets = func(cudnName string) []string {
+			nad, err := nadClient.NetworkAttachmentDefinitions(namespace).Get(context.TODO(), cudnName, metav1.GetOptions{})
 			Expect(err).NotTo(HaveOccurred())
 			var result map[string]interface{}
 			err = json.Unmarshal([]byte(nad.Spec.Config), &result)
@@ -1870,10 +1870,39 @@ write_files:
 				return serverIPs, serverPort
 			}
 		)
+
+		const (
+			// bgpCloudConnectorNamespaceLabelKey/Value select the namespace for
+			// the bgp-cloud-connector BGPRouting CR's generated
+			// ClusterUserDefinedNetwork. Must match the BGPRouting CR applied
+			// once during AWS infra setup by
+			// openshift/test/infraprovider.ensureBGPCloudConnector.
+			bgpCloudConnectorNamespaceLabelKey   = "cluster-udn"
+			bgpCloudConnectorNamespaceLabelValue = "aws-bgp-poc"
+			bgpCloudConnectorCUDNName            = "cluster-udn-" + bgpCloudConnectorNamespaceLabelValue
+			bgpCloudConnectorIPv4CIDR            = "10.200.0.0/16"
+			// bgpCloudConnectorIPv6CIDR is a throwaway, syntactically valid
+			// CIDR - not advertised anywhere (the cluster is single-stack
+			// IPv4) - kept only so the unconditional FRR static-route
+			// injection below has a non-empty value to work with.
+			bgpCloudConnectorIPv6CIDR = "fd00:200::/64"
+		)
 		DescribeTable("should keep ip", func(td testData) {
 			if td.role == "" {
 				td.role = udnv1.NetworkRoleSecondary
 			}
+
+			// useBGPCloudConnectorNetwork routes this specific Entry (Primary/
+			// Layer2/routed, non-EVPN) through a pre-existing, bgp-cloud-connector-
+			// managed ClusterUserDefinedNetwork + RouteAdvertisements (created once
+			// during AWS infra setup via a BGPRouting CR) instead of creating a
+			// fresh per-spec CUDN/RA. All other Entries in this table, and this
+			// same Entry when AWS_BGP_CLOUD_CONNECTOR is unset, are unaffected.
+			useBGPCloudConnectorNetwork := os.Getenv("AWS_BGP_CLOUD_CONNECTOR") == "1" &&
+				td.topology == udnv1.NetworkTopologyLayer2 &&
+				td.role == udnv1.NetworkRolePrimary &&
+				td.ingress == "routed" &&
+				td.evpn == nil
 
 			l := map[string]string{
 				"e2e-framework": fr.BaseName,
@@ -1881,20 +1910,38 @@ write_files:
 			if td.role == udnv1.NetworkRolePrimary {
 				l[RequiredUDNNamespaceLabel] = ""
 			}
+			if useBGPCloudConnectorNetwork {
+				l[bgpCloudConnectorNamespaceLabelKey] = bgpCloudConnectorNamespaceLabelValue
+			}
 			ns, err := fr.CreateNamespace(context.TODO(), fr.BaseName, l)
 			Expect(err).NotTo(HaveOccurred())
 			fr.Namespace = ns
 			namespace = fr.Namespace.Name
 
 			networkName := ""
-			// Each entry gets its own random subnet to avoid BGP route
-			// conflicts between entries (prior routed tests create RAs
-			// whose BGP routes may persist in FRR after async cleanup).
-			cidrIPv4, cidrIPv6 = randomCUDNSubnets()
-			staticIPv4 = subnetOffsetIP(cidrIPv4, 101)
-			staticIPv6 = subnetOffsetIP(cidrIPv6, 101)
-			dualCIDRs := filterDualStackCIDRs(fr.ClientSet, []udnv1.CIDR{udnv1.CIDR(cidrIPv4), udnv1.CIDR(cidrIPv6)})
-			cudn, networkName = kubevirt.GenerateCUDN(namespace, "net1", td.topology, td.role, dualCIDRs)
+			// dualCIDRs is hoisted to this scope (rather than declared only
+			// inside the branches below) because it is also read further
+			// down, past both branches, to compute expectedNumberOfAddresses.
+			var dualCIDRs udnv1.DualStackCIDRs
+			if useBGPCloudConnectorNetwork {
+				// Fixed (not random) subnet: this network is long-lived,
+				// managed by the BGPRouting CR applied once during AWS infra
+				// setup, not recreated per spec run. Single-stack IPv4 to
+				// match the BGPRouting CR's spec.network.subnets.
+				cidrIPv4 = bgpCloudConnectorIPv4CIDR
+				cidrIPv6 = bgpCloudConnectorIPv6CIDR
+				staticIPv4 = subnetOffsetIP(cidrIPv4, 101)
+				dualCIDRs = udnv1.DualStackCIDRs{udnv1.CIDR(cidrIPv4)}
+			} else {
+				// Each entry gets its own random subnet to avoid BGP route
+				// conflicts between entries (prior routed tests create RAs
+				// whose BGP routes may persist in FRR after async cleanup).
+				cidrIPv4, cidrIPv6 = randomCUDNSubnets()
+				staticIPv4 = subnetOffsetIP(cidrIPv4, 101)
+				staticIPv6 = subnetOffsetIP(cidrIPv6, 101)
+				dualCIDRs = filterDualStackCIDRs(fr.ClientSet, []udnv1.CIDR{udnv1.CIDR(cidrIPv4), udnv1.CIDR(cidrIPv6)})
+				cudn, networkName = kubevirt.GenerateCUDN(namespace, "net1", td.topology, td.role, dualCIDRs)
+			}
 
 			var externalContainer infraapi.ExternalContainer
 			var macVRFContainerIPs []string
@@ -1993,9 +2040,23 @@ write_files:
 				By("setting up the localnet underlay")
 				Expect(providerCtx.SetupUnderlay(fr, infraapi.Underlay{LogicalNetworkName: networkName})).To(Succeed())
 			}
-			createCUDN(cudn)
+			// cudnName is hoisted here (rather than reading cudn.Name directly
+			// at each use site below) because cudn stays nil for the whole
+			// spec when useBGPCloudConnectorNetwork is true - it reuses the
+			// pre-existing, fixed-name CUDN instead of creating/naming one.
+			cudnName := bgpCloudConnectorCUDNName
+			if useBGPCloudConnectorNetwork {
+				By("Waiting for namespace to be adopted by the bgp-cloud-connector-managed ClusterUserDefinedNetwork")
+				Eventually(func() error {
+					_, err := nadClient.NetworkAttachmentDefinitions(namespace).Get(context.TODO(), bgpCloudConnectorCUDNName, metav1.GetOptions{})
+					return err
+				}, 60*time.Second, time.Second).Should(Succeed())
+			} else {
+				createCUDN(cudn)
+				cudnName = cudn.Name
+			}
 
-			if td.ingress == "routed" {
+			if td.ingress == "routed" && !useBGPCloudConnectorNetwork {
 				ra := &rav1.RouteAdvertisements{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: cudn.Name,
@@ -2025,7 +2086,7 @@ write_files:
 			selectedNodes = workerNodeList.Items
 			Expect(selectedNodes).NotTo(BeEmpty())
 
-			iperfServerTestPods, err = createIperfServerPods(selectedNodes, cudn.Name, td.role, []string{})
+			iperfServerTestPods, err = createIperfServerPods(selectedNodes, cudnName, td.role, []string{})
 			Expect(err).NotTo(HaveOccurred())
 
 			if td.role == udnv1.NetworkRolePrimary && td.evpn == nil {
@@ -2107,7 +2168,7 @@ ip route add %[3]s via %[4]s
 			}
 
 			expectedAddresesAtGuest := expectedAddreses
-			testPodsIPs := podsMultusNetworkIPs(iperfServerTestPods, podNetworkStatusByNetConfigPredicate(namespace, cudn.Name, strings.ToLower(string(td.role))))
+			testPodsIPs := podsMultusNetworkIPs(iperfServerTestPods, podNetworkStatusByNetConfigPredicate(namespace, cudnName, strings.ToLower(string(td.role))))
 
 			serverIPs, serverPort := exposeVMIperfServer(td, vmi, expectedAddreses)
 
@@ -2134,7 +2195,7 @@ ip route add %[3]s via %[4]s
 				if isIPv6Supported(fr.ClientSet) {
 					step = by(vmi.Name, fmt.Sprintf("Checking IPv6 gateway before %s %s", td.resource.description, td.test.description))
 
-					expectedIPv6GatewayPath, err := kubevirt.GenerateGatewayIPv6RouterLLA(getCUDNSubnets(cudn))
+					expectedIPv6GatewayPath, err := kubevirt.GenerateGatewayIPv6RouterLLA(getCUDNSubnets(cudnName))
 					Expect(err).NotTo(HaveOccurred())
 					Eventually(kubevirt.RetrieveIPv6Gateways).
 						WithArguments(virtClient, vmi).
@@ -2217,7 +2278,7 @@ ip route add %[3]s via %[4]s
 					step = by(vmi.Name, fmt.Sprintf("Checking IPv4 gateway cached mac after %s %s", td.resource.description, td.test.description))
 					Expect(crClient.Get(context.TODO(), crclient.ObjectKeyFromObject(vmi), vmi)).To(Succeed())
 
-					expectedGatewayMAC, err := kubevirt.GenerateGatewayMAC(getCUDNSubnets(cudn))
+					expectedGatewayMAC, err := kubevirt.GenerateGatewayMAC(getCUDNSubnets(cudnName))
 					Expect(err).NotTo(HaveOccurred(), step)
 
 					Expect(err).NotTo(HaveOccurred(), step)
@@ -2231,7 +2292,7 @@ ip route add %[3]s via %[4]s
 					step = by(vmi.Name, fmt.Sprintf("Checking IPv6 gateway after %s %s", td.resource.description, td.test.description))
 					By(step)
 
-					targetNodeIPv6GatewayPath, err := kubevirt.GenerateGatewayIPv6RouterLLA(getCUDNSubnets(cudn))
+					targetNodeIPv6GatewayPath, err := kubevirt.GenerateGatewayIPv6RouterLLA(getCUDNSubnets(cudnName))
 					Expect(err).NotTo(HaveOccurred())
 					Eventually(kubevirt.RetrieveIPv6Gateways).
 						WithArguments(virtClient, vmi).

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
 	configclient "github.com/openshift/client-go/config/clientset/versioned"
@@ -326,21 +327,152 @@ func initializeAWSInfra(config *rest.Config) (*awsInfra, error) {
 		}
 	}
 
-	// --- Step 5: Create per-AZ FRRConfiguration CRs for FRR-k8s ---
-	// The upstream kubevirt test creates a RouteAdvertisements CR that
-	// requires at least one FRRConfiguration to be present in the cluster.
-	// Each FRRConfiguration tells the FRR-k8s pods in a specific AZ to
-	// peer with the RS endpoint in their own subnet (directly connected,
-	// no eBGP multihop needed). This per-AZ model aligns with the
-	// rosa-bgp-operator architecture.
+	// --- Step 5: Configure FRR-k8s <-> Route Server BGP peering ---
+	// Either via the bgp-cloud-connector operator (AWS_BGP_CLOUD_CONNECTOR=1)
+	// or, by default, via hand-rolled per-AZ FRRConfiguration CRs (legacy
+	// standalone path, unchanged).
 	if ci.infraState != nil && len(ci.infraState.RouteServerEndpointIPs) > 0 {
-		framework.Logf("Creating per-AZ FRRConfiguration CRs for FRR-k8s...")
-		if err := createPerAZFRRConfigurations(clusterInfo, ci.infraState.RouteServerEndpointIPs); err != nil {
-			framework.Logf("WARNING: failed to create FRRConfiguration CRs: %v", err)
+		if os.Getenv("AWS_BGP_CLOUD_CONNECTOR") == "1" {
+			if err := ensureBGPCloudConnector(clusterInfo, ci.infraState); err != nil {
+				return nil, fmt.Errorf("failed to integrate with bgp-cloud-connector: %w", err)
+			}
+		} else {
+			framework.Logf("Creating per-AZ FRRConfiguration CRs for FRR-k8s...")
+			if err := createPerAZFRRConfigurations(clusterInfo, ci.infraState.RouteServerEndpointIPs); err != nil {
+				framework.Logf("WARNING: failed to create FRRConfiguration CRs: %v", err)
+			}
 		}
 	}
 
 	return ci, nil
+}
+
+// Constants shared with test/e2e/kubevirt.go's useBGPCloudConnectorNetwork
+// path (bgpCloudConnectorNamespaceLabelValue/bgpCloudConnectorIPv4CIDR
+// there) — keep both sides in sync if changed.
+const (
+	bgpRouterNodeLabelKey   = "bgp_router"
+	bgpRouterNodeLabelValue = "true"
+	bgpLocalASN             = 65001
+	bgpRoutingNetworkName   = "aws-bgp-poc"
+	bgpRoutingIPv4CIDR      = "10.200.0.0/16"
+)
+
+// ensureBGPCloudConnector hands FRR-k8s <-> Route Server peering over to the
+// bgp-cloud-connector operator instead of the hand-rolled per-AZ
+// FRRConfiguration path: it labels the BGP-enabled worker nodes, then applies
+// a BGPCloudConfiguration (singleton — triggers the Network operator
+// FRR/routeAdvertisements patch, auto-discovers the just-created Route
+// Server's per-AZ endpoints/ASN, generates per-AZ FRRConfigurations, and
+// reconciles Route Server peers + SourceDestCheck dynamically) and a
+// BGPRouting CR (creates the ClusterUserDefinedNetwork + shared
+// RouteAdvertisements that test/e2e/kubevirt.go's "Primary/Layer2 ingress
+// routed" spec attaches to when AWS_BGP_CLOUD_CONNECTOR=1, instead of
+// creating its own per-spec CUDN/RA).
+//
+// The operator must already be deployed (namespace
+// openshift-bgp-cloud-connector) — that is out of scope for this test.
+func ensureBGPCloudConnector(clusterInfo *AWSClusterInfo, infraState *AWSInfraState) error {
+	framework.Logf("Integrating with bgp-cloud-connector (AWS_BGP_CLOUD_CONNECTOR=1)...")
+
+	framework.Logf("  Labeling BGP-enabled worker nodes (%s=%s)...", bgpRouterNodeLabelKey, bgpRouterNodeLabelValue)
+	for _, worker := range clusterInfo.Workers {
+		out, err := exec.Command("kubectl", "label", "node", worker.NodeName,
+			fmt.Sprintf("%s=%s", bgpRouterNodeLabelKey, bgpRouterNodeLabelValue), "--overwrite").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to label node %s: %w\noutput: %s", worker.NodeName, err, string(out))
+		}
+		framework.Logf("    %s: %s", worker.NodeName, strings.TrimSpace(string(out)))
+	}
+
+	bgpCloudConfigYAML := fmt.Sprintf(`apiVersion: networking.openshift.io/v1beta1
+kind: BGPCloudConfiguration
+metadata:
+  name: cluster
+spec:
+  platform: AWS
+  routerNodeSelector:
+    %s: %q
+  bgp:
+    localASN: %d
+  aws:
+    region: %s
+    routeServerIDs:
+      - %s
+`, bgpRouterNodeLabelKey, bgpRouterNodeLabelValue, bgpLocalASN, clusterInfo.Region, infraState.RouteServerID)
+
+	framework.Logf("  Applying BGPCloudConfiguration (routeServerID=%s, region=%s, localASN=%d)...",
+		infraState.RouteServerID, clusterInfo.Region, bgpLocalASN)
+	if err := kubectlApplyYAML(bgpCloudConfigYAML); err != nil {
+		return fmt.Errorf("failed to apply BGPCloudConfiguration: %w", err)
+	}
+	if err := waitForBGPCCPhaseReady("bgpcloudconfiguration", "cluster", 10*time.Minute); err != nil {
+		return err
+	}
+	framework.Logf("  BGPCloudConfiguration is Ready")
+
+	bgpRoutingYAML := fmt.Sprintf(`apiVersion: networking.openshift.io/v1beta1
+kind: BGPRouting
+metadata:
+  name: %s
+spec:
+  network:
+    name: %s
+    subnets:
+      - %s
+`, bgpRoutingNetworkName, bgpRoutingNetworkName, bgpRoutingIPv4CIDR)
+
+	framework.Logf("  Applying BGPRouting (network=%s, subnet=%s)...", bgpRoutingNetworkName, bgpRoutingIPv4CIDR)
+	if err := kubectlApplyYAML(bgpRoutingYAML); err != nil {
+		return fmt.Errorf("failed to apply BGPRouting: %w", err)
+	}
+	if err := waitForBGPCCPhaseReady("bgprouting", bgpRoutingNetworkName, 5*time.Minute); err != nil {
+		return err
+	}
+	framework.Logf("  BGPRouting is Ready")
+
+	return nil
+}
+
+// kubectlApplyYAML applies a YAML manifest via stdin.
+func kubectlApplyYAML(yaml string) error {
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(yaml)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kubectl apply failed: %w\noutput: %s", err, string(out))
+	}
+	framework.Logf("    %s", strings.TrimSpace(string(out)))
+	return nil
+}
+
+// waitForBGPCCPhaseReady polls a bgp-cloud-connector CR's status.phase until
+// it reaches "Ready", logging status.conditions on stall or Degraded.
+func waitForBGPCCPhaseReady(resource, name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	getConditions := func() string {
+		out, _ := exec.Command("kubectl", "get", resource, name, "-o", "jsonpath={.status.conditions}").CombinedOutput()
+		return strings.TrimSpace(string(out))
+	}
+	for {
+		out, err := exec.Command("kubectl", "get", resource, name, "-o", "jsonpath={.status.phase}").CombinedOutput()
+		phase := strings.TrimSpace(string(out))
+		switch {
+		case err == nil && phase == "Ready":
+			return nil
+		case err == nil && phase == "Degraded":
+			framework.Logf("    WARNING: %s/%s is Degraded, conditions: %s", resource, name, getConditions())
+		case err == nil:
+			framework.Logf("    %s/%s phase: %q (waiting...)", resource, name, phase)
+		default:
+			framework.Logf("    WARNING: failed to get %s/%s phase: %v", resource, name, err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for %s/%s to reach phase=Ready (last phase: %q, conditions: %s)",
+				resource, name, phase, getConditions())
+		}
+		time.Sleep(10 * time.Second)
+	}
 }
 
 // createPerAZFRRConfigurations creates one FRRConfiguration CR per AZ in the

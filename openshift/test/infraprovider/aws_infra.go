@@ -147,17 +147,25 @@ func createAWSInfrastructure(clusterInfo *AWSClusterInfo, publicIP string) (*AWS
 	// ============================================================
 	// 2. Disable src/dst check on workers
 	// ============================================================
-	framework.Logf("Disabling src/dst checks on worker instances...")
-	for _, worker := range clusterInfo.Workers {
-		if _, err := awsCLIText(region,
-			"ec2", "modify-instance-attribute",
-			"--instance-id", worker.InstanceID,
-			"--no-source-dest-check",
-		); err != nil {
-			return state, fmt.Errorf("failed to disable src/dst check on %s: %w",
-				worker.InstanceID, err)
+	// Skipped when AWS_BGP_CLOUD_CONNECTOR=1: the bgp-cloud-connector
+	// operator's BGPCloudConfiguration reconciler disables SourceDestCheck
+	// itself for every node matching its routerNodeSelector, dynamically,
+	// on node add/remove/IP-change. See ensureBGPCloudConnector in aws.go.
+	if os.Getenv("AWS_BGP_CLOUD_CONNECTOR") == "" {
+		framework.Logf("Disabling src/dst checks on worker instances...")
+		for _, worker := range clusterInfo.Workers {
+			if _, err := awsCLIText(region,
+				"ec2", "modify-instance-attribute",
+				"--instance-id", worker.InstanceID,
+				"--no-source-dest-check",
+			); err != nil {
+				return state, fmt.Errorf("failed to disable src/dst check on %s: %w",
+					worker.InstanceID, err)
+			}
+			state.DisabledSrcDstInstances = append(state.DisabledSrcDstInstances, worker.InstanceID)
 		}
-		state.DisabledSrcDstInstances = append(state.DisabledSrcDstInstances, worker.InstanceID)
+	} else {
+		framework.Logf("Skipping static src/dst check disable (AWS_BGP_CLOUD_CONNECTOR=1 — operator manages this dynamically)")
 	}
 
 	// ============================================================
@@ -252,25 +260,35 @@ func createAWSInfrastructure(clusterInfo *AWSClusterInfo, publicIP string) (*AWS
 
 	// Register workers as Route Server peers — each worker peers with the
 	// RS endpoint in its own subnet (directly connected, no eBGP multihop).
-	for _, worker := range clusterInfo.Workers {
-		endpointID := state.RouteServerEndpointIDs[worker.SubnetID]
-		peerID, err := awsCLIText(region,
-			"ec2", "create-route-server-peer",
-			"--route-server-endpoint-id", endpointID,
-			"--peer-address", worker.PrivateIP,
-			"--bgp-options", "PeerAsn=65001",
-			"--query", "RouteServerPeer.RouteServerPeerId",
-		)
-		if err != nil {
-			return state, fmt.Errorf("failed to create RS peer for %s: %w",
-				worker.NodeName, err)
+	//
+	// Skipped when AWS_BGP_CLOUD_CONNECTOR=1: the bgp-cloud-connector
+	// operator's BGPCloudConfiguration reconciler creates these peers
+	// itself, per-AZ, dynamically discovered from the Route Server
+	// endpoints above, and keeps them in sync on node changes. See
+	// ensureBGPCloudConnector in aws.go.
+	if os.Getenv("AWS_BGP_CLOUD_CONNECTOR") == "" {
+		for _, worker := range clusterInfo.Workers {
+			endpointID := state.RouteServerEndpointIDs[worker.SubnetID]
+			peerID, err := awsCLIText(region,
+				"ec2", "create-route-server-peer",
+				"--route-server-endpoint-id", endpointID,
+				"--peer-address", worker.PrivateIP,
+				"--bgp-options", "PeerAsn=65001",
+				"--query", "RouteServerPeer.RouteServerPeerId",
+			)
+			if err != nil {
+				return state, fmt.Errorf("failed to create RS peer for %s: %w",
+					worker.NodeName, err)
+			}
+			// RS peer doesn't support tag-on-create; tag after
+			awsCLIText(region, "ec2", "create-tags",
+				"--resources", peerID,
+				"--tags", fmt.Sprintf("Key=%s,Value=%s", awsBGPTestTagKey, awsBGPTestTagValue))
+			state.RouteServerPeerIDs = append(state.RouteServerPeerIDs, peerID)
+			framework.Logf("  RS peer: %s -> %s (%s) on endpoint %s", peerID, worker.PrivateIP, worker.NodeName, endpointID)
 		}
-		// RS peer doesn't support tag-on-create; tag after
-		awsCLIText(region, "ec2", "create-tags",
-			"--resources", peerID,
-			"--tags", fmt.Sprintf("Key=%s,Value=%s", awsBGPTestTagKey, awsBGPTestTagValue))
-		state.RouteServerPeerIDs = append(state.RouteServerPeerIDs, peerID)
-		framework.Logf("  RS peer: %s -> %s (%s) on endpoint %s", peerID, worker.PrivateIP, worker.NodeName, endpointID)
+	} else {
+		framework.Logf("Skipping static Route Server peer creation (AWS_BGP_CLOUD_CONNECTOR=1 — operator manages peers dynamically)")
 	}
 
 	// ============================================================
