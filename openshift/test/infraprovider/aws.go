@@ -426,10 +426,21 @@ spec:
 	if err := kubectlApplyYAML(bgpRoutingYAML); err != nil {
 		return fmt.Errorf("failed to apply BGPRouting: %w", err)
 	}
-	if err := waitForBGPCCPhaseReady("bgprouting", bgpRoutingNetworkName, 5*time.Minute); err != nil {
-		return err
-	}
-	framework.Logf("  BGPRouting is Ready")
+	// Intentionally not waiting for phase=Ready here: BGPRouting's
+	// controller requires at least one namespace to already exist with the
+	// required labels (k8s.ovn.org/primary-user-defined-network and
+	// cluster-udn=<name>) before it can create the CUDN - see
+	// reconciliation.md "Validate Namespace + Create CUDN". No such
+	// namespace exists yet at this point (AWS infra setup runs before any
+	// Ginkgo spec), so BGPRouting will sit in Degraded/NamespaceNotReady
+	// until test/e2e/kubevirt.go's useBGPCloudConnectorNetwork path creates
+	// and labels its namespace later - at which point that same code waits
+	// for the resulting NetworkAttachmentDefinition to appear before
+	// proceeding. Applying it now (rather than from within the spec) just
+	// means it is already in place, reacting as soon as a matching
+	// namespace shows up, instead of racing CUDN creation against the VM
+	// setup that immediately follows it in the spec.
+	framework.Logf("  BGPRouting applied (will reach Ready once a namespace labeled cluster-udn=%s exists)", bgpRoutingNetworkName)
 
 	return nil
 }
