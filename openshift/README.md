@@ -201,6 +201,37 @@ Group rules, and the on-prem FRR container. The operator only *discovers*
 an existing Route Server (via `spec.aws.routeServerIDs`) — it does not
 provision one.
 
+### VM network binding: `l2bridge`, not native `bridge`, for Primary UDN
+
+This applies regardless of `AWS_BGP_CLOUD_CONNECTOR` — it's a KubeVirt/UDN
+requirement, not something either mode of this PoC changes. Easy to get
+wrong because of a naming collision between two different things both
+called "bridge":
+
+| VM's network source | Required binding | Used by (this file) |
+|---|---|---|
+| `Pod: &kubevirtv1.PodNetwork{}` (**Primary** UDN — the VM's own default pod network *is* the UDN, which is what `useBGPCloudConnectorNetwork` and the rest of this integration target) | `Binding: &kubevirtv1.PluginBinding{Name: "l2bridge"}` | `virtualMachineWithUDN`, `virtualMachineWithUDNAndStaticIPsAndMAC`, `virtualMachineInstanceWithUDN`, and 3 more — 6/6 Primary-UDN resource commands in `kubevirt.go`, no exceptions |
+| `Multus: &kubevirtv1.MultusNetwork{NetworkName: ...}` (**Secondary** network — the UDN is attached as an *additional* NAD-backed interface alongside the normal default network) | native `Bridge: &kubevirtv1.InterfaceBridge{}` | `virtualMachine`, `virtualMachineInstance` — the `generateVMI` default, left untouched |
+
+Using native `bridge` (or leaving the interface on its implicit default,
+`masquerade`) for a **Primary** UDN VM silently breaks inbound UDN traffic —
+`masquerade`'s nftables rules block it outright, and native `bridge`
+doesn't correctly wire up OVN-Kubernetes's primary-network-swap plumbing
+(the pod ends up with its real UDN address on an `ovn-udn1` interface
+marked `"default": true` in the `k8s.v1.cni.cncf.io/network-status`
+annotation, which native `bridge` binding isn't aware of). `l2bridge` is
+the network-binding-plugin built to handle that wiring correctly; it's
+"equivalent to bridge binding" in bgp-cloud-connector's own words
+([`test-mtv-cudn.md`](https://github.com/openshift/bgp-cloud-connector/blob/main/docs/test-mtv-cudn.md))
+precisely *because* it's the Primary-UDN-aware counterpart to it, not a
+synonym for the same object — their `kubevirt-testing.md`'s "must use
+`bridge` binding, not `masquerade`" is using "bridge" as the category
+(bridge-style vs. NAT-style), not the literal `bridge: {}` field.
+
+The VM this PoC actually runs and verified end to end (live migration
+included) uses `l2bridge`, confirming the row above in practice, not just
+in the upstream test's own source.
+
 ### What `ensureBGPCloudConnector()` does (in `aws.go`)
 
 Runs once, during AWS infra setup (before any Ginkgo spec), right after the
