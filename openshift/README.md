@@ -296,14 +296,63 @@ to externally-BGP-routed ingress combined with Layer2 UDN's
 every-node-advertises-the-same-shared-prefix model, not a general
 cross-node connectivity problem.
 
-This is **not** introduced by the `bgp-cloud-connector` integration — both
-modes generate functionally equivalent per-AZ `FRRConfiguration`s and the
-same AWS route-table behavior applies either way. It was reproduced 3 of 4
-runs (VM scheduled onto the non-preferred AZ each time); the one run where
-placement happened to match passed cleanly end to end, including live
-migration. Diagnosing/fixing the underlying AWS/OVN-Kubernetes interaction
-is tracked as follow-up work; for now, a quick way to confirm or route
-around it mid-run:
+**Root cause, confirmed against AWS's own documentation (not just
+empirical observation):** [How Amazon VPC Route Server
+works](https://docs.aws.amazon.com/vpc/latest/userguide/route-server-how-it-works.html)
+states Route Server "computes a Forwarding Information Base (FIB) from the
+RIB, **selecting the best available routes**," and its worked example is
+explicit that this is MED-based best-path selection for **active/standby
+failover** between two devices advertising the same prefix — not ECMP load
+balancing. There is no multipath mode; this is the service working exactly
+as designed for its intended use case (e.g. a firewall appliance pair), not
+a bug or a missing configuration option. The CLI's own
+`create-route-server-peer` reference confirms the only tunable is
+`BgpOptions` (ASN/BFD) — nothing multipath-related.
+
+**This is not a limitation of `bgp-cloud-connector`, or of any particular
+way of authoring the BGP configuration.** The responsibility boundary is
+two layers, both upstream of whatever tool creates the `FRRConfiguration`:
+
+1. **AWS VPC Route Server** picks one best path by design (above) —
+   identical behavior regardless of who or what configured the BGP
+   sessions it's watching.
+2. **OVN-Kubernetes's Layer2 UDN model** has every participating node
+   advertise the *same* shared prefix (unlike Layer3 UDN, where each node
+   carves and advertises its own unique host-subnet) — which is *why*
+   Route Server faces this tie in the first place.
+
+The standalone (hand-rolled) mode and `AWS_BGP_CLOUD_CONNECTOR=1` both
+produce functionally identical per-AZ `FRRConfiguration`s (same ASN, same
+neighbor relationship, no MED, no local-pref override) — swapping which one
+authors the config changes nothing about what Route Server does with it
+afterward. Fixing this would need either an AWS-side change (no ECMP option
+exists today) or an OVN-Kubernetes-side change (making the "losing" node's
+gateway router correctly redirect cross-chassis instead of looping).
+
+It was reproduced 3 of 4 full end-to-end runs (VM scheduled onto the
+non-preferred AZ each time); the one run where placement happened to match
+passed cleanly end to end, including live migration. A follow-up attempt to
+get an `ovn-trace`/OVS-flow-level root cause of the loop itself (as opposed
+to the AWS-side cause of *why* traffic lands on the wrong node) hit a
+separate complication: on infrastructure that had already been recreated
+and churned repeatedly over several hours, even bare node-to-node IP
+reachability from on-prem became asymmetric (one node's IP reachable, the
+other silently dropped) — independent of the UDN prefix entirely. [VPC
+Reachability
+Analyzer](https://docs.aws.amazon.com/vpc/latest/reachability/what-is-reachability-analyzer.html)
+confirmed this specific symptom was not a VPC-internal routing/security-group/NACL
+issue (`NetworkPathFound: true`, no blockers, for the node-to-node ENI
+path), and the per-worker TGW Connect peers turned out to be vestigial —
+BGP status `down` on all of them, since the actual on-prem↔AWS path runs
+entirely over the Site-to-Site VPN's own two tunnels. This points at the
+VPN/TGW layer rather than Route Server/OVN, but wasn't conclusively
+isolated; treat it as a separate, likely transient finding tied to that
+specific long-running infrastructure, not a third permanent limitation.
+Recreating AWS infra fresh before the next investigation attempt would
+remove this variable.
+
+For now, a quick way to confirm or route around the original (Route
+Server/OVN) finding mid-run:
 
 ```bash
 # Find which node AWS currently prefers for the UDN prefix vs where the VM is
