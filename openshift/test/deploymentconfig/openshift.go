@@ -18,6 +18,8 @@ import (
 	"k8s.io/client-go/rest"
 	e2epodoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
 	imageutils "k8s.io/kubernetes/test/utils/image"
+
+	imageclient "github.com/openshift/client-go/image/clientset/versioned"
 )
 
 var (
@@ -81,6 +83,17 @@ func (m *openshift) SetupImages() error {
 		return err
 	}
 
+	// ImageStream resolution requires cluster access; keep offline discovery
+	// available when no kubeconfig is supplied.
+	if m.kubeConfig != nil {
+		imageConfigMap[api.Netshoot], err = imageConfigWithPullSpecFromImageStream(m.kubeConfig,
+			api.Netshoot,
+			"network-tools:latest")
+		if err != nil {
+			return err
+		}
+	}
+
 	m.imageConfigMap = imageConfigMap
 	return nil
 }
@@ -140,6 +153,23 @@ func imageConfigWithPullSpecFromMirror(imageID api.ImageID, pullSpec string) (ap
 	return api.ImageConfig{
 		ImageID:  imageID,
 		PullSpec: pullSpec,
+	}, nil
+}
+
+func imageConfigWithPullSpecFromImageStream(kubeConfig *rest.Config, imageID api.ImageID, imageStream string) (api.ImageConfig, error) {
+	imageClient, err := imageclient.NewForConfig(kubeConfig)
+	if err != nil {
+		return api.ImageConfig{}, fmt.Errorf("failed resolving pull spec while retrieving openshift image client: %w", err)
+	}
+
+	istag, err := imageClient.ImageV1().ImageStreamTags("openshift").Get(context.Background(), imageStream, metav1.GetOptions{})
+	if err != nil {
+		return api.ImageConfig{}, fmt.Errorf("failed resolving pull spec while retrieving image stream tags from %q: %w", imageStream, err)
+	}
+
+	return api.ImageConfig{
+		ImageID:  imageID,
+		PullSpec: istag.Image.DockerImageReference,
 	}, nil
 }
 
